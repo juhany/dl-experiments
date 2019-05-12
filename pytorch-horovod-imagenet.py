@@ -1,0 +1,302 @@
+"""
+Based on https://github.com/pytorch/examples/blob/master/imagenet/main.py
+"""
+import argparse
+import os
+import time
+import sys
+
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torchvision.models as models
+
+import horovod.torch as hvd
+
+model_names = sorted(name for name in models.__dict__
+	if name.islower() and not name.startswith("__")
+	and callable(models.__dict__[name]))
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+	'--arch', metavar='ARCH', default='resnet50',
+	choices=model_names,
+	help='model architecture: ' +
+	' | '.join(model_names) +
+	' (default: resnet50)')
+parser.add_argument(
+	'--bs', type=int, required=True, metavar='N',
+	help='Mini-batch size.')
+parser.add_argument(
+	'--lr', '--learning-rate', default=0.05, type=float, metavar='LR',
+	help='Initial learning rate', dest='lr')
+parser.add_argument(
+	'--epochs', default=1, type=int, metavar='N',
+	help='Number of total epochs to run. (default: 1)')
+parser.add_argument(
+	'--num_warmup_epochs', type=int, required=False, default=0, metavar='N',
+	help='Number of warmup epochs. (default: 0)')
+parser.add_argument(
+	'--num_loader_threads', type=int, required=False, default=4, metavar='N',
+	help='Number of dataset loader threads. (default: 4)')
+parser.add_argument(
+	'--data', metavar='DIR',
+	help='Path to dataset.')
+
+best_acc1 = 0
+
+# Initialize Horovod.
+hvd.init()
+
+# Horovod: pin GPU to local rank.
+torch.cuda.set_device(hvd.local_rank())
+
+def main():
+	args = parser.parse_args()
+	if hvd.rank() == 0:
+		print("torch.version.__version__=%s" % torch.version.__version__)
+		print("torch.cuda.is_available()=%s" % torch.cuda.is_available())
+		print("torch.version.cuda=%s" % torch.version.cuda)
+		print("torch.backends.cudnn.version()=%s" % torch.backends.cudnn.version())
+	main_worker(args)
+
+def main_worker(args):
+	global best_acc1
+
+	if hvd.rank() == 0:
+		print("=> creating model '{}'".format(args.arch))
+	model = models.__dict__[args.arch]()
+	
+	# Move model to GPU.
+	model.cuda()
+
+	# Use CrossEntropyLoss with multi-class classification.
+	criterion = nn.CrossEntropyLoss().cuda()
+
+	# Default hyperparameters based on PyTorch Imagenet examples.
+	optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=0.9, weight_decay=1e-4)
+
+	# Horovod: wrap optimizer with DistributedOptimizer.
+	optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), compression=hvd.Compression.none)
+
+	cudnn.benchmark = True
+	traindir = os.path.join(args.data, 'train')
+	valdir = os.path.join(args.data, 'val')
+
+	# Default normalizations based on PyTorch Imagenet examples.
+	normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+					std=[0.229, 0.224, 0.225])
+
+	# Default transforms based on PyTorch Imagenet examples.
+	train_dataset = datasets.ImageFolder(
+		traindir,
+		transforms.Compose([
+			transforms.RandomResizedCrop(224),
+			transforms.RandomHorizontalFlip(),
+			transforms.ToTensor(),
+			normalize,
+		])
+	)
+
+        # The sampler defines the strategy to draw samples from the dataset. If specified, shuffle must be False.
+	# Horovod: use DistributedSampler to partition data among workers. Manually specify
+	# `num_replicas=hvd.size()` and `rank=hvd.rank()`.
+	train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
+
+	train_loader = torch.utils.data.DataLoader(
+		train_dataset, batch_size=args.bs, shuffle=(train_sampler is None),
+		num_workers=args.num_loader_threads, pin_memory=True, sampler=train_sampler)
+
+	val_loader = torch.utils.data.DataLoader(
+		datasets.ImageFolder(valdir, transforms.Compose([
+			transforms.Resize(256),
+			transforms.CenterCrop(224),
+			transforms.ToTensor(),
+			normalize,
+		])),
+		batch_size=args.bs, shuffle=False,
+		num_workers=args.num_loader_threads, pin_memory=True)
+
+	# Horovod: broadcast parameters & optimizer state.
+	hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+	hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
+	for epoch in range(0, args.epochs):
+
+		train_sampler.set_epoch(epoch)
+		adjust_learning_rate(optimizer, epoch, args)
+
+		# Train the model.
+		train(train_loader, model, criterion, optimizer, epoch, args)
+
+		# Validate accuracy on valdation set.
+		acc1 = validate(val_loader, model, criterion, args)
+
+		# Remember best acc@1 and save best model.
+		is_best = acc1 > best_acc1
+		best_acc1 = max(acc1, best_acc1)
+
+		# Horovod: only save model on rank 0
+		if is_best and (hvd.rank() == 0):
+			state = {
+				'epoch': epoch + 1,
+				'arch': args.arch,
+				'state_dict': model.state_dict(),
+				'best_acc1': best_acc1,
+				'optimizer' : optimizer.state_dict(),
+				}
+			torch.save(state, 'model_best.pth.tar')
+
+def adjust_learning_rate(optimizer, epoch, args):
+	"""Adjusts the learning rate per https://arxiv.org/pdf/1706.02677.pdf"""
+	# Apply gradual warmup for num_warmup_epochs if global batch size >= 512.
+	if ((epoch < args.num_warmup_epochs) and (args.bs * hvd.size() >= 128)):
+		base_lr = (args.bs / 256) * 0.1
+		step_size = (args.lr - base_lr) / args.num_warmup_epochs
+
+		if hvd.rank() == 0:
+			print("Applying gradual warmup for epoch {}. ".format(epoch) + "(batch_size={}, ".format(args.bs) + "world_size={})".format(hvd.size()))
+		lr = base_lr + (step_size * epoch)
+	else:
+		if epoch < 30:
+			p = 0
+		elif epoch < 60:
+			p = 1
+		elif epoch < 80:
+			p = 2
+		else:
+			p = 3
+		lr = args.lr * (0.1 ** p)
+	if hvd.rank() == 0:
+		print("Setting learning rate for epoch {}".format(epoch) + ' ' + "to {}".format(lr))
+	for param_group in optimizer.param_groups:
+		param_group['lr'] = lr
+
+def accuracy(output, target, topk=(1,)):
+	"""Computes the accuracy over the k top predictions for the specified values of k"""
+	with torch.no_grad():
+		maxk = max(topk)
+		batch_size = target.size(0)
+
+		_, pred = output.topk(maxk, 1, True, True)
+		pred = pred.t()
+		correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+		res = []
+		for k in topk:
+			correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+			res.append(correct_k.mul_(100.0 / batch_size))
+		return res
+
+class AverageMeter(object):
+	"""Computes and stores the average and current value"""
+	def __init__(self):
+		self.reset()
+
+	def reset(self):
+		self.val = 0
+		self.avg = 0
+		self.sum = 0
+		self.count = 0
+
+	def update(self, val, n=1):
+		self.val = val
+		self.sum += val * n
+		self.count += n
+		self.avg = self.sum / self.count
+
+def train(train_loader, model, criterion, optimizer, epoch, args):
+
+	batch_time = AverageMeter()
+	data_time = AverageMeter()
+	losses = AverageMeter()
+	top1 = AverageMeter()
+	top5 = AverageMeter()
+
+	# Switch to train mode.
+	model.train()
+
+	end = time.time()
+	for i, (input, target) in enumerate(train_loader):
+		# Measure data loading time.
+		data_time.update(time.time() - end)
+
+		input = input.cuda()
+		target = target.cuda(non_blocking=True)
+
+		# Compute output.
+		output = model(input)
+		loss = criterion(output, target)
+
+		# Measure accuracy and record loss.
+		acc1, acc5 = accuracy(output, target, topk=(1, 5))
+		losses.update(loss.item(), input.size(0))
+		top1.update(acc1[0], input.size(0))
+		top5.update(acc5[0], input.size(0))
+
+		# Compute gradient and do SGD step.
+		optimizer.zero_grad()
+		loss.backward()
+		optimizer.step()
+
+		# Measure elapsed time.
+		batch_time.update(time.time() - end)
+		end = time.time()
+
+		if hvd.rank() == 0:
+			print('Epoch: [{0}][{1}/{2}]\t'
+				'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+				'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+				'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+				'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+				'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+					epoch, i, len(train_loader), batch_time=batch_time,
+					data_time=data_time, loss=losses, top1=top1, top5=top5))
+
+def validate(val_loader, model, criterion, args):
+	batch_time = AverageMeter()
+	losses = AverageMeter()
+	top1 = AverageMeter()
+	top5 = AverageMeter()
+
+	# Switch to evaluate mode.
+	model.eval()
+
+	with torch.no_grad():
+		end = time.time()
+		for i, (input, target) in enumerate(val_loader):
+			input = input.cuda()
+			target = target.cuda(non_blocking=True)
+
+			# Compute output.
+			output = model(input)
+			loss = criterion(output, target)
+
+			# Measure accuracy and record loss.
+			acc1, acc5 = accuracy(output, target, topk=(1, 5))
+			losses.update(loss.item(), input.size(0))
+			top1.update(acc1[0], input.size(0))
+			top5.update(acc5[0], input.size(0))
+
+			# Measure elapsed time.
+			batch_time.update(time.time() - end)
+			end = time.time()
+
+			if hvd.rank() == 0:
+				print('Test: [{0}/{1}]\t'
+					'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+					'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+					'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+					'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+						i, len(val_loader), batch_time=batch_time, loss=losses,
+						top1=top1, top5=top5))
+		if hvd.rank() == 0:
+			print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
+	return top1.avg
+
+if __name__ == '__main__':
+	main()
